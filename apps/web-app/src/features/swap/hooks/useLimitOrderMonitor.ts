@@ -124,6 +124,10 @@ export function useLimitOrderMonitor({
     onOrderReadyRef.current = onOrderReady;
   }, [onOrderReady]);
 
+  // Re-entrancy guard: prevents overlapping poll() runs when a poll takes
+  // longer than the interval (e.g. slow Soroswap API with many open orders).
+  const inFlightRef = useRef(false);
+
   const poll = useCallback(async () => {
     if (!walletAddress || !apiKeyConfigured) return;
 
@@ -171,24 +175,26 @@ export function useLimitOrderMonitor({
       });
 
       if (shouldTrigger) {
-        incrementConfirmation(order.id);
-
-        // Read the freshest confirmation count from ordersRef
-        const fresh = ordersRef.current.find((o) => o.id === order.id);
-        const confirmations = fresh
-          ? fresh.consecutiveConfirmations + 1 // +1 because mutation is async
-          : 1;
+        // incrementConfirmation returns the new consecutive count computed
+        // inside the setState updater, so we never infer it from a stale ref.
+        const confirmations = incrementConfirmation(order.id);
 
         if (confirmations >= LIMIT_ORDER_CONFIRM_POLLS) {
-          markReady(order.id);
-          useActivityStore.getState().pushEvent({
-            source: "swap",
-            type: "limit-order-ready",
-            timestamp: Date.now(),
-            summary: `Limit order ready: Sell ${order.amountIn} ${order.tokenInSymbol} for ${order.tokenOutSymbol}`,
-            link: "/swap",
-          });
-          onOrderReadyRef.current?.(order);
+          // markReady is idempotent: it only transitions an "open" order to
+          // "ready" and returns true exactly once per transition.
+          const transitioned = markReady(order.id);
+          if (transitioned) {
+            const fresh =
+              ordersRef.current.find((o) => o.id === order.id) ?? order;
+            useActivityStore.getState().pushEvent({
+              source: "swap",
+              type: "limit-order-ready",
+              timestamp: Date.now(),
+              summary: `Limit order ready: Sell ${order.amountIn} ${order.tokenInSymbol} for ${order.tokenOutSymbol}`,
+              link: "/swap",
+            });
+            onOrderReadyRef.current?.(fresh);
+          }
         }
       } else {
         resetConfirmation(order.id);
@@ -206,10 +212,21 @@ export function useLimitOrderMonitor({
   useEffect(() => {
     if (!walletAddress || !apiKeyConfigured) return;
 
+    // Wraps poll() with an in-flight guard so overlapping runs are impossible.
+    const runPoll = async () => {
+      if (inFlightRef.current) return;
+      inFlightRef.current = true;
+      try {
+        await poll();
+      } finally {
+        inFlightRef.current = false;
+      }
+    };
+
     // Run once immediately, then on interval.
-    void poll();
+    void runPoll();
     const intervalId = setInterval(() => {
-      void poll();
+      void runPoll();
     }, LIMIT_ORDER_POLL_INTERVAL_MS);
 
     return () => {

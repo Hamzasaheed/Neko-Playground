@@ -24,5 +24,12 @@ export const LIMIT_ORDER_POLL_INTERVAL_MS = 15_000;
  */
 export const LIMIT_ORDER_CONFIRM_POLLS = 2;
 
+/**
+ * Maximum number of concurrent quote requests issued by the limit-order
+ * monitor within a single poll tick. Bounds load against the rate-limited
+ * Soroswap API while still allowing per-order quotes to fan out.
+ */
+export const LIMIT_ORDER_MAX_CONCURRENT_QUOTES = 3;
+
 /** localStorage schema version; bump when the LimitOrder shape changes. */
 export const LIMIT_ORDER_STORAGE_VERSION = 1;
