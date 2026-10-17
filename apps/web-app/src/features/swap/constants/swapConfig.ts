@@ -19,17 +19,17 @@ export const ORDER_HISTORY_LIMIT = 20;
 export const LIMIT_ORDER_POLL_INTERVAL_MS = 15_000;
 
 /**
- * Maximum number of per-order quote requests the monitor fans out
- * concurrently within a single poll tick. Bounds load against the
- * rate-limited Soroswap API while still avoiding a fully serial loop.
- */
-export const LIMIT_ORDER_POLL_CONCURRENCY = 3;
-
-/**
  * Number of consecutive polls that must confirm the price condition before
  * an order is marked "ready to fill". Guards against stale/noisy quotes.
  */
 export const LIMIT_ORDER_CONFIRM_POLLS = 2;
+
+/**
+ * Maximum number of per-order quote requests that may be in flight at once
+ * while polling open limit orders. Bounds concurrency against the rate-limited
+ * Soroswap API and prevents overlapping poll runs from multiplying requests.
+ */
+export const LIMIT_ORDER_MAX_CONCURRENT_QUOTES = 3;
 
 /** localStorage schema version; bump when the LimitOrder shape changes. */
 export const LIMIT_ORDER_STORAGE_VERSION = 1;

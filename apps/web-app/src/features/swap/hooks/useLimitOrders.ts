@@ -1,7 +1,6 @@
 "use client";
 
-import { useState, useCallback, useEffect } from "react";
-import { useRef } from "react";
+import { useState, useCallback, useEffect, useRef } from "react";
 import type {
   LimitOrder,
   LimitOrderSide,
@@ -12,7 +11,6 @@ import { EXPIRY_MS } from "../types/limitOrder";
 import { LIMIT_ORDER_STORAGE_VERSION } from "../constants/swapConfig";
 import type { Token } from "@/lib/helpers/stellar/soroswap";
 import { DEFAULT_SLIPPAGE_BPS } from "../constants/swapConfig";
-import { LIMIT_ORDER_CONFIRM_POLLS } from "../constants/swapConfig";
 
 // ─── Storage helpers ──────────────────────────────────────────────────────────
 
@@ -61,6 +59,15 @@ export interface AddLimitOrderParams {
   slippageBps?: number;
 }
 
+export interface ConfirmationResult {
+  /** The order after the update, or null if it was not found. */
+  order: LimitOrder | null;
+  /** The new consecutive confirmation count. */
+  consecutiveConfirmations: number;
+  /** True only on the transition into `ready` (fires exactly once). */
+  becameReady: boolean;
+}
+
 export interface UseLimitOrdersReturn {
   orders: LimitOrder[];
   addOrder: (params: AddLimitOrderParams) => LimitOrder;
@@ -68,10 +75,8 @@ export interface UseLimitOrdersReturn {
   markFilled: (id: string) => void;
   markExpired: (id: string) => void;
   markReady: (id: string) => void;
-  /** Atomically records a confirming poll. Returns the resulting order (or null). */
-  confirmPoll: (id: string) => LimitOrder | null;
-  incrementConfirmation: (id: string) => void;
-  resetConfirmation: (id: string) => void;
+  incrementConfirmation: (id: string, threshold: number) => ConfirmationResult;
+  resetConfirmation: (id: string) => ConfirmationResult;
   clearOrders: () => void;
 }
 
@@ -88,8 +93,11 @@ export function useLimitOrders(
     return loadFromStorage(walletAddress);
   });
 
-  // Mirror of `orders` kept in sync for synchronous reads inside callbacks.
+  // Mirror of the latest orders for synchronous reads (e.g. returning a
+  // freshly-mutated order from an action). Kept in sync inside the setState
+  // updater so it is never stale relative to committed state.
   const ordersRef = useRef<LimitOrder[]>(orders);
+  ordersRef.current = orders;
 
   // Re-hydrate when wallet address changes (connect / switch).
   useEffect(() => {
@@ -107,6 +115,7 @@ export function useLimitOrders(
     saveToStorage(walletAddress, orders);
   }, [walletAddress, orders]);
 
+  // Keep the synchronous mirror in sync with committed state.
   useEffect(() => {
     ordersRef.current = orders;
   }, [orders]);
@@ -187,63 +196,69 @@ export function useLimitOrders(
     [mutate]
   );
 
-  /**
-   * Atomically records a confirming poll for an order and, if the order has
-   * reached LIMIT_ORDER_CONFIRM_POLLS consecutive confirmations, transitions it
-   * to `ready` in the same state update. Returns the resulting order so callers
-   * can fire side effects (activity event, callback) exactly once per
-   * transition, using the current — not stale — snapshot.
-   */
-  const confirmPoll = useCallback((id: string): LimitOrder | null => {
-    let result: LimitOrder | null = null;
-    setOrders((prev) => {
-      let changed = false;
-      const next = prev.map((o) => {
-        if (o.id !== id) return o;
-        if (o.status !== "open") {
-          result = o;
-          return o;
-        }
-        const confirmations = o.consecutiveConfirmations + 1;
-        const shouldReady = confirmations >= LIMIT_ORDER_CONFIRM_POLLS;
-        const updated: LimitOrder = {
-          ...o,
-          consecutiveConfirmations: shouldReady
-            ? LIMIT_ORDER_CONFIRM_POLLS
-            : confirmations,
-          status: shouldReady ? "ready" : o.status,
-        };
-        result = updated;
-        changed = true;
-        return updated;
-      });
-      return changed ? next : prev;
-    });
-    return result;
-  }, []);
-
   const incrementConfirmation = useCallback(
-    (id: string) => {
-      mutate((prev) =>
-        prev.map((o) =>
-          o.id === id
-            ? { ...o, consecutiveConfirmations: o.consecutiveConfirmations + 1 }
-            : o
-        )
-      );
+    (id: string, threshold: number): ConfirmationResult => {
+      // Compute the result synchronously from the freshest committed state so
+      // the caller never has to infer the new count from a stale ref. The
+      // threshold check and the `ready` transition happen atomically inside
+      // the setState updater, guaranteeing exactly-once semantics.
+      const current = ordersRef.current.find((o) => o.id === id);
+      if (!current) {
+        return { order: null, consecutiveConfirmations: 0, becameReady: false };
+      }
+
+      const nextCount = current.consecutiveConfirmations + 1;
+      const becameReady =
+        current.status === "open" && nextCount >= threshold;
+
+      let updated: LimitOrder | null = null;
+      setOrders((prev) => {
+        const idx = prev.findIndex((o) => o.id === id);
+        if (idx === -1) return prev;
+        const o = prev[idx];
+        const count = o.consecutiveConfirmations + 1;
+        const ready = o.status === "open" && count >= threshold;
+        const next: LimitOrder = {
+          ...o,
+          consecutiveConfirmations: count,
+          status: ready ? "ready" : o.status,
+        };
+        updated = next;
+        const copy = prev.slice();
+        copy[idx] = next;
+        return copy;
+      });
+
+      return {
+        order: updated,
+        consecutiveConfirmations: nextCount,
+        becameReady,
+      };
     },
-    [mutate]
+    []
   );
 
   const resetConfirmation = useCallback(
-    (id: string) => {
-      mutate((prev) =>
-        prev.map((o) =>
-          o.id === id ? { ...o, consecutiveConfirmations: 0 } : o
-        )
-      );
+    (id: string): ConfirmationResult => {
+      const current = ordersRef.current.find((o) => o.id === id);
+      if (!current) {
+        return { order: null, consecutiveConfirmations: 0, becameReady: false };
+      }
+
+      let updated: LimitOrder | null = null;
+      setOrders((prev) => {
+        const idx = prev.findIndex((o) => o.id === id);
+        if (idx === -1) return prev;
+        const next: LimitOrder = { ...prev[idx], consecutiveConfirmations: 0 };
+        updated = next;
+        const copy = prev.slice();
+        copy[idx] = next;
+        return copy;
+      });
+
+      return { order: updated, consecutiveConfirmations: 0, becameReady: false };
     },
-    [mutate]
+    []
   );
 
   const clearOrders = useCallback(() => {
@@ -257,7 +272,6 @@ export function useLimitOrders(
     markFilled,
     markExpired,
     markReady,
-    confirmPoll,
     incrementConfirmation,
     resetConfirmation,
     clearOrders,

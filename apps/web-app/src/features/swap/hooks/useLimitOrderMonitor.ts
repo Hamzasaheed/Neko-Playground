@@ -102,6 +102,7 @@ export function useLimitOrderMonitor({
   } = actions;
   const prevAddressRef = useRef<string | undefined>(walletAddress);
   const apiKeyConfigured = hasApiKey();
+  const inFlightRef = useRef(false);
 
   // Detect wallet disconnect and clear in-memory orders.
   useEffect(() => {
@@ -123,6 +124,13 @@ export function useLimitOrderMonitor({
   useEffect(() => {
     onOrderReadyRef.current = onOrderReady;
   }, [onOrderReady]);
+
+  // Keep a stable ref to the latest actions so the interval callback
+  // always uses the freshest mutation helpers.
+  const actionsRef = useRef(actions);
+  useEffect(() => {
+    actionsRef.current = actions;
+  }, [actions]);
 
   const poll = useCallback(async () => {
     if (!walletAddress || !apiKeyConfigured) return;
@@ -171,20 +179,26 @@ export function useLimitOrderMonitor({
       });
 
       if (shouldTrigger) {
+        // incrementConfirmation returns the new count synchronously from
+        // inside the setState updater, so we never infer it from a stale ref.
         const confirmations = incrementConfirmation(order.id);
 
         if (confirmations >= LIMIT_ORDER_CONFIRM_POLLS) {
-          const fresh = ordersRef.current.find((o) => o.id === order.id);
-          if (fresh && fresh.status === "ready") continue;
-          markReady(order.id);
+          // markReady returns true only on the first transition to "ready",
+          // making the activity event and callback fire exactly once.
+          const transitioned = markReady(order.id);
+          if (!transitioned) continue;
+
+          const fresh =
+            ordersRef.current.find((o) => o.id === order.id) ?? order;
           useActivityStore.getState().pushEvent({
             source: "swap",
             type: "limit-order-ready",
             timestamp: Date.now(),
-            summary: `Limit order ready: Sell ${order.amountIn} ${order.tokenInSymbol} for ${order.tokenOutSymbol}`,
+            summary: `Limit order ready: Sell ${fresh.amountIn} ${fresh.tokenInSymbol} for ${fresh.tokenOutSymbol}`,
             link: "/swap",
           });
-          onOrderReadyRef.current?.(fresh ?? order);
+          onOrderReadyRef.current?.(fresh);
         }
       } else {
         resetConfirmation(order.id);
@@ -199,17 +213,27 @@ export function useLimitOrderMonitor({
     resetConfirmation,
   ]);
 
+  const guardedPoll = useCallback(async () => {
+    if (inFlightRef.current) return;
+    inFlightRef.current = true;
+    try {
+      await poll();
+    } finally {
+      inFlightRef.current = false;
+    }
+  }, [poll]);
+
   useEffect(() => {
     if (!walletAddress || !apiKeyConfigured) return;
 
     // Run once immediately, then on interval.
-    void poll();
+    void guardedPoll();
     const intervalId = setInterval(() => {
-      void poll();
+      void guardedPoll();
     }, LIMIT_ORDER_POLL_INTERVAL_MS);
 
     return () => {
       clearInterval(intervalId);
     };
-  }, [walletAddress, apiKeyConfigured, poll]);
+  }, [walletAddress, apiKeyConfigured, guardedPoll]);
 }
