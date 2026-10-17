@@ -25,9 +25,9 @@ export const LIMIT_ORDER_POLL_INTERVAL_MS = 15_000;
 export const LIMIT_ORDER_CONFIRM_POLLS = 2;
 
 /**
- * Maximum number of concurrent quote requests issued by the limit-order
- * monitor within a single poll tick. Bounds load against the rate-limited
- * Soroswap API while still allowing per-order quotes to fan out.
+ * Maximum number of per-order quote requests the monitor will have in flight
+ * concurrently during a single poll tick. Bounds load against the rate-limited
+ * Soroswap API while still allowing orders to be checked in parallel.
  */
 export const LIMIT_ORDER_MAX_CONCURRENT_QUOTES = 3;
 

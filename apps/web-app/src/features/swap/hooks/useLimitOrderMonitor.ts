@@ -87,6 +87,9 @@ async function fetchCurrentPrice(
  * Auto-expires orders past their expiresAt timestamp.
  * Calls `clearOrders()` when walletAddress goes from defined → undefined.
  */
+// Tracks whether a poll is currently in flight to prevent overlapping runs.
+let pollInFlight = false;
+
 export function useLimitOrderMonitor({
   walletAddress,
   orders,
@@ -119,16 +122,20 @@ export function useLimitOrderMonitor({
     ordersRef.current = orders;
   }, [orders]);
 
+  // Tracks whether a poll is currently in flight to prevent overlapping runs.
+  const pollInFlightRef = useRef(false);
+
   const onOrderReadyRef = useRef(onOrderReady);
   useEffect(() => {
     onOrderReadyRef.current = onOrderReady;
   }, [onOrderReady]);
 
-  // Re-entrancy guard: prevents overlapping poll() runs when a poll takes
-  // longer than the interval (e.g. slow Soroswap API with many open orders).
-  const inFlightRef = useRef(false);
-
   const poll = useCallback(async () => {
+    // Re-entrancy guard: skip this tick if a previous poll is still running.
+    if (pollInFlightRef.current) return;
+    pollInFlightRef.current = true;
+
+    try {
     if (!walletAddress || !apiKeyConfigured) return;
 
     const now = Date.now();
@@ -175,30 +182,32 @@ export function useLimitOrderMonitor({
       });
 
       if (shouldTrigger) {
-        // incrementConfirmation returns the new consecutive count computed
-        // inside the setState updater, so we never infer it from a stale ref.
+        // incrementConfirmation returns the new count synchronously so we
+        // never infer it from a stale ref. The threshold check is atomic
+        // with the mutation inside the reducer.
         const confirmations = incrementConfirmation(order.id);
 
         if (confirmations >= LIMIT_ORDER_CONFIRM_POLLS) {
-          // markReady is idempotent: it only transitions an "open" order to
-          // "ready" and returns true exactly once per transition.
-          const transitioned = markReady(order.id);
-          if (transitioned) {
-            const fresh =
-              ordersRef.current.find((o) => o.id === order.id) ?? order;
-            useActivityStore.getState().pushEvent({
-              source: "swap",
-              type: "limit-order-ready",
-              timestamp: Date.now(),
-              summary: `Limit order ready: Sell ${order.amountIn} ${order.tokenInSymbol} for ${order.tokenOutSymbol}`,
-              link: "/swap",
-            });
-            onOrderReadyRef.current?.(fresh);
-          }
+          markReady(order.id);
+          useActivityStore.getState().pushEvent({
+            source: "swap",
+            type: "limit-order-ready",
+            timestamp: Date.now(),
+            summary: `Limit order ready: Sell ${order.amountIn} ${order.tokenInSymbol} for ${order.tokenOutSymbol}`,
+            link: "/swap",
+          });
+          // Read the freshest order snapshot so the callback receives the
+          // current state, not the stale one captured at the top of the loop.
+          const freshOrder =
+            ordersRef.current.find((o) => o.id === order.id) ?? order;
+          onOrderReadyRef.current?.(freshOrder);
         }
       } else {
         resetConfirmation(order.id);
       }
+    }
+    } finally {
+      pollInFlightRef.current = false;
     }
   }, [
     walletAddress,
@@ -212,21 +221,10 @@ export function useLimitOrderMonitor({
   useEffect(() => {
     if (!walletAddress || !apiKeyConfigured) return;
 
-    // Wraps poll() with an in-flight guard so overlapping runs are impossible.
-    const runPoll = async () => {
-      if (inFlightRef.current) return;
-      inFlightRef.current = true;
-      try {
-        await poll();
-      } finally {
-        inFlightRef.current = false;
-      }
-    };
-
     // Run once immediately, then on interval.
-    void runPoll();
+    void poll();
     const intervalId = setInterval(() => {
-      void runPoll();
+      void poll();
     }, LIMIT_ORDER_POLL_INTERVAL_MS);
 
     return () => {

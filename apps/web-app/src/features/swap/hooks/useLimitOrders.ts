@@ -1,6 +1,6 @@
 "use client";
 
-import { useState, useCallback, useEffect, useRef } from "react";
+import { useState, useCallback, useEffect } from "react";
 import type {
   LimitOrder,
   LimitOrderSide,
@@ -11,8 +11,6 @@ import { EXPIRY_MS } from "../types/limitOrder";
 import { LIMIT_ORDER_STORAGE_VERSION } from "../constants/swapConfig";
 import type { Token } from "@/lib/helpers/stellar/soroswap";
 import { DEFAULT_SLIPPAGE_BPS } from "../constants/swapConfig";
-
-type ReadyListener = (order: LimitOrder) => void;
 
 // ─── Storage helpers ──────────────────────────────────────────────────────────
 
@@ -71,8 +69,6 @@ export interface UseLimitOrdersReturn {
   incrementConfirmation: (id: string) => number;
   resetConfirmation: (id: string) => void;
   clearOrders: () => void;
-  /** Register a listener fired exactly once per order when it transitions to ready. */
-  onOrderReady: (listener: ReadyListener) => () => void;
 }
 
 /**
@@ -87,12 +83,6 @@ export function useLimitOrders(
     if (!walletAddress) return [];
     return loadFromStorage(walletAddress);
   });
-
-  // Mirror of the latest orders, kept in sync synchronously inside the
-  // setState updater so callers can read the freshest committed value.
-  const ordersRef = useRef<LimitOrder[]>(orders);
-  ordersRef.current = orders;
-  const readyListenersRef = useRef<Set<ReadyListener>>(new Set());
 
   // Re-hydrate when wallet address changes (connect / switch).
   useEffect(() => {
@@ -109,12 +99,6 @@ export function useLimitOrders(
     if (!walletAddress) return;
     saveToStorage(walletAddress, orders);
   }, [walletAddress, orders]);
-
-  const emitReady = useCallback((order: LimitOrder) => {
-    for (const listener of readyListenersRef.current) {
-      listener(order);
-    }
-  }, []);
 
   // ── Helpers ──────────────────────────────────────────────────────────────
 
@@ -185,43 +169,48 @@ export function useLimitOrders(
 
   const markReady = useCallback(
     (id: string) => {
-      let transitioned: LimitOrder | null = null;
-      mutate((prev) => {
-        const target = prev.find((o) => o.id === id);
-        if (!target || target.status === "ready") return prev;
-        const next = prev.map((o) =>
-          o.id === id ? { ...o, status: "ready" as const } : o
-        );
-        transitioned = next.find((o) => o.id === id) ?? null;
-        return next;
-      });
-      if (transitioned) emitReady(transitioned);
+      mutate((prev) =>
+        prev.map((o) =>
+          o.id === id && o.status === "open"
+            ? { ...o, status: "ready" }
+            : o
+        )
+      );
     },
-    [mutate, emitReady]
+    [mutate]
   );
 
   const incrementConfirmation = useCallback(
     (id: string): number => {
-      // Compute the new count inside the updater (where the previous value is
-      // authoritative) and return it synchronously to the caller. This avoids
-      // inferring the count from a ref that may lag the mutation.
-      const current = ordersRef.current.find((o) => o.id === id);
-      const nextCount = (current?.consecutiveConfirmations ?? 0) + 1;
-      mutate((prev) =>
-        prev.map((o) =>
-          o.id === id ? { ...o, consecutiveConfirmations: nextCount } : o
-        )
-      );
+      // Compute the new count synchronously from the latest state so callers
+      // never have to infer it from a ref that lags behind React commits.
+      // We read the freshest value via the functional updater and stash it
+      // in a local variable that is assigned during the same commit.
+      let nextCount = 0;
+      setOrders((prev) => {
+        const idx = prev.findIndex((o) => o.id === id);
+        if (idx === -1) {
+          nextCount = 0;
+          return prev;
+        }
+        const current = prev[idx];
+        nextCount = current.consecutiveConfirmations + 1;
+        const next = prev.slice();
+        next[idx] = { ...current, consecutiveConfirmations: nextCount };
+        return next;
+      });
       return nextCount;
     },
-    [mutate]
+    []
   );
 
   const resetConfirmation = useCallback(
     (id: string) => {
       mutate((prev) =>
         prev.map((o) =>
-          o.id === id ? { ...o, consecutiveConfirmations: 0 } : o
+          o.id === id && o.consecutiveConfirmations !== 0
+            ? { ...o, consecutiveConfirmations: 0 }
+            : o
         )
       );
     },
@@ -230,13 +219,6 @@ export function useLimitOrders(
 
   const clearOrders = useCallback(() => {
     setOrders([]);
-  }, []);
-
-  const onOrderReady = useCallback((listener: ReadyListener) => {
-    readyListenersRef.current.add(listener);
-    return () => {
-      readyListenersRef.current.delete(listener);
-    };
   }, []);
 
   return {
@@ -249,6 +231,5 @@ export function useLimitOrders(
     incrementConfirmation,
     resetConfirmation,
     clearOrders,
-    onOrderReady,
   };
 }
