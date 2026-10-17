@@ -1,6 +1,7 @@
 "use client";
 
 import { useState, useCallback, useEffect } from "react";
+import { useRef } from "react";
 import type {
   LimitOrder,
   LimitOrderSide,
@@ -11,6 +12,7 @@ import { EXPIRY_MS } from "../types/limitOrder";
 import { LIMIT_ORDER_STORAGE_VERSION } from "../constants/swapConfig";
 import type { Token } from "@/lib/helpers/stellar/soroswap";
 import { DEFAULT_SLIPPAGE_BPS } from "../constants/swapConfig";
+import { LIMIT_ORDER_CONFIRM_POLLS } from "../constants/swapConfig";
 
 // ─── Storage helpers ──────────────────────────────────────────────────────────
 
@@ -66,7 +68,9 @@ export interface UseLimitOrdersReturn {
   markFilled: (id: string) => void;
   markExpired: (id: string) => void;
   markReady: (id: string) => void;
-  incrementConfirmation: (id: string) => number;
+  /** Atomically records a confirming poll. Returns the resulting order (or null). */
+  confirmPoll: (id: string) => LimitOrder | null;
+  incrementConfirmation: (id: string) => void;
   resetConfirmation: (id: string) => void;
   clearOrders: () => void;
 }
@@ -84,6 +88,9 @@ export function useLimitOrders(
     return loadFromStorage(walletAddress);
   });
 
+  // Mirror of `orders` kept in sync for synchronous reads inside callbacks.
+  const ordersRef = useRef<LimitOrder[]>(orders);
+
   // Re-hydrate when wallet address changes (connect / switch).
   useEffect(() => {
     if (!walletAddress) {
@@ -99,6 +106,10 @@ export function useLimitOrders(
     if (!walletAddress) return;
     saveToStorage(walletAddress, orders);
   }, [walletAddress, orders]);
+
+  useEffect(() => {
+    ordersRef.current = orders;
+  }, [orders]);
 
   // ── Helpers ──────────────────────────────────────────────────────────────
 
@@ -170,9 +181,53 @@ export function useLimitOrders(
   const markReady = useCallback(
     (id: string) => {
       mutate((prev) =>
+        prev.map((o) => (o.id === id ? { ...o, status: "ready" } : o))
+      );
+    },
+    [mutate]
+  );
+
+  /**
+   * Atomically records a confirming poll for an order and, if the order has
+   * reached LIMIT_ORDER_CONFIRM_POLLS consecutive confirmations, transitions it
+   * to `ready` in the same state update. Returns the resulting order so callers
+   * can fire side effects (activity event, callback) exactly once per
+   * transition, using the current — not stale — snapshot.
+   */
+  const confirmPoll = useCallback((id: string): LimitOrder | null => {
+    let result: LimitOrder | null = null;
+    setOrders((prev) => {
+      let changed = false;
+      const next = prev.map((o) => {
+        if (o.id !== id) return o;
+        if (o.status !== "open") {
+          result = o;
+          return o;
+        }
+        const confirmations = o.consecutiveConfirmations + 1;
+        const shouldReady = confirmations >= LIMIT_ORDER_CONFIRM_POLLS;
+        const updated: LimitOrder = {
+          ...o,
+          consecutiveConfirmations: shouldReady
+            ? LIMIT_ORDER_CONFIRM_POLLS
+            : confirmations,
+          status: shouldReady ? "ready" : o.status,
+        };
+        result = updated;
+        changed = true;
+        return updated;
+      });
+      return changed ? next : prev;
+    });
+    return result;
+  }, []);
+
+  const incrementConfirmation = useCallback(
+    (id: string) => {
+      mutate((prev) =>
         prev.map((o) =>
-          o.id === id && o.status === "open"
-            ? { ...o, status: "ready" }
+          o.id === id
+            ? { ...o, consecutiveConfirmations: o.consecutiveConfirmations + 1 }
             : o
         )
       );
@@ -180,37 +235,11 @@ export function useLimitOrders(
     [mutate]
   );
 
-  const incrementConfirmation = useCallback(
-    (id: string): number => {
-      // Compute the new count synchronously from the latest state so callers
-      // never have to infer it from a ref that lags behind React commits.
-      // We read the freshest value via the functional updater and stash it
-      // in a local variable that is assigned during the same commit.
-      let nextCount = 0;
-      setOrders((prev) => {
-        const idx = prev.findIndex((o) => o.id === id);
-        if (idx === -1) {
-          nextCount = 0;
-          return prev;
-        }
-        const current = prev[idx];
-        nextCount = current.consecutiveConfirmations + 1;
-        const next = prev.slice();
-        next[idx] = { ...current, consecutiveConfirmations: nextCount };
-        return next;
-      });
-      return nextCount;
-    },
-    []
-  );
-
   const resetConfirmation = useCallback(
     (id: string) => {
       mutate((prev) =>
         prev.map((o) =>
-          o.id === id && o.consecutiveConfirmations !== 0
-            ? { ...o, consecutiveConfirmations: 0 }
-            : o
+          o.id === id ? { ...o, consecutiveConfirmations: 0 } : o
         )
       );
     },
@@ -228,6 +257,7 @@ export function useLimitOrders(
     markFilled,
     markExpired,
     markReady,
+    confirmPoll,
     incrementConfirmation,
     resetConfirmation,
     clearOrders,

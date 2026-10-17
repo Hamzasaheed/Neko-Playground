@@ -87,9 +87,6 @@ async function fetchCurrentPrice(
  * Auto-expires orders past their expiresAt timestamp.
  * Calls `clearOrders()` when walletAddress goes from defined → undefined.
  */
-// Tracks whether a poll is currently in flight to prevent overlapping runs.
-let pollInFlight = false;
-
 export function useLimitOrderMonitor({
   walletAddress,
   orders,
@@ -122,20 +119,12 @@ export function useLimitOrderMonitor({
     ordersRef.current = orders;
   }, [orders]);
 
-  // Tracks whether a poll is currently in flight to prevent overlapping runs.
-  const pollInFlightRef = useRef(false);
-
   const onOrderReadyRef = useRef(onOrderReady);
   useEffect(() => {
     onOrderReadyRef.current = onOrderReady;
   }, [onOrderReady]);
 
   const poll = useCallback(async () => {
-    // Re-entrancy guard: skip this tick if a previous poll is still running.
-    if (pollInFlightRef.current) return;
-    pollInFlightRef.current = true;
-
-    try {
     if (!walletAddress || !apiKeyConfigured) return;
 
     const now = Date.now();
@@ -182,12 +171,11 @@ export function useLimitOrderMonitor({
       });
 
       if (shouldTrigger) {
-        // incrementConfirmation returns the new count synchronously so we
-        // never infer it from a stale ref. The threshold check is atomic
-        // with the mutation inside the reducer.
         const confirmations = incrementConfirmation(order.id);
 
         if (confirmations >= LIMIT_ORDER_CONFIRM_POLLS) {
+          const fresh = ordersRef.current.find((o) => o.id === order.id);
+          if (fresh && fresh.status === "ready") continue;
           markReady(order.id);
           useActivityStore.getState().pushEvent({
             source: "swap",
@@ -196,18 +184,11 @@ export function useLimitOrderMonitor({
             summary: `Limit order ready: Sell ${order.amountIn} ${order.tokenInSymbol} for ${order.tokenOutSymbol}`,
             link: "/swap",
           });
-          // Read the freshest order snapshot so the callback receives the
-          // current state, not the stale one captured at the top of the loop.
-          const freshOrder =
-            ordersRef.current.find((o) => o.id === order.id) ?? order;
-          onOrderReadyRef.current?.(freshOrder);
+          onOrderReadyRef.current?.(fresh ?? order);
         }
       } else {
         resetConfirmation(order.id);
       }
-    }
-    } finally {
-      pollInFlightRef.current = false;
     }
   }, [
     walletAddress,
